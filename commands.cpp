@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <map>
 #include <sstream>
-#include <stdlib.h>
 
 //Name of the window the batch file is running on
 #define SERVERWND "MCServerCommands"
@@ -44,11 +43,30 @@ BOOL __stdcall EnumProcessWindowsProc(HWND hwnd, LPARAM lParam) {
 
 	return true;
 }
-std::ifstream& goto_line(std::ifstream& file, long long num){
+std::ifstream& goto_line(std::ifstream& file, long long num) {
     file.seekg(std::ios::beg);
     for(long long i = 0; i < num - 1; ++i)
         file.ignore(std::numeric_limits<std::streamsize>::max(),'\n');
     return file;
+}
+
+std::vector<std::string> files_in_dir(std::string dir) {
+	HANDLE find;
+    WIN32_FIND_DATAA ffd;
+
+	find = FindFirstFileA((dir + "\\*").c_str(), &ffd);
+	if (find == INVALID_HANDLE_VALUE)
+		return { };
+
+	std::vector<std::string> rv;
+
+	do
+		if(strcmp(ffd.cFileName, ".") && strcmp(ffd.cFileName, "..") && !(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+			rv.push_back(ffd.cFileName);
+	while(FindNextFileA(find, &ffd));
+
+	FindClose(find);
+	return rv;
 }
 /*************************************************************************/
 
@@ -84,7 +102,7 @@ DWORD WINAPI compile_command(LPVOID params) {
 	buffer << raw.rdbuf() << '\n';
 	raw.close();
 
-	std::ofstream formatted { "commands\\tmp\\" + msg[0] + ".cpp" };
+	std::ofstream formatted { "commands\\raw\\" + msg[0] + ".cpp" };
 	if(!formatted.is_open()) {
 		delete (compile_params*)params;
 		return 0;
@@ -97,7 +115,7 @@ DWORD WINAPI compile_command(LPVOID params) {
 
 	SHELLEXECUTEINFOA compile { 0 };
 
-	std::string exec = std::string("commands\\tmp\\" + msg[0] + ".cpp -shared -o commands\\compiled\\" + msg[0] + ".dll commands\\functions.o");
+	std::string exec = std::string("commands\\raw\\" + msg[0] + ".cpp -shared -o commands\\compiled\\" + msg[0] + ".dll commands\\functions.o");
 
 	compile.cbSize			= sizeof(SHELLEXECUTEINFOA);
 	compile.fMask			= SEE_MASK_NOCLOSEPROCESS;
@@ -111,15 +129,19 @@ DWORD WINAPI compile_command(LPVOID params) {
 	ShellExecuteExA(&compile);
 	WaitForSingleObject(compile.hProcess, INFINITE);
 
+	if(GetFileAttributesA(std::string("commands\\raw\\" + msg[0] + ".cpp").c_str()) != INVALID_FILE_ATTRIBUTES)
+		DeleteFileA(std::string("commands\\raw\\" + msg[0] + ".cpp").c_str());
 	if(GetFileAttributesA(std::string("commands\\compiled\\" + msg[0] + ".dll").c_str()) == INVALID_FILE_ATTRIBUTES) {
 		delete (compile_params*)params;
 		return 0;
 	}
+
 	HINSTANCE dll = LoadLibraryA(std::string("commands\\compiled\\" + msg[0] + ".dll").c_str());
 	mccommand func = (mccommand)GetProcAddress(dll, msg[0].c_str());
-	(*func)(hwnd, msg);
 	commands.emplace(msg[0], func);
 	dlls.emplace(msg[0], dll);
+	if(hwnd)
+		(*func)(hwnd, msg);
 
 	delete (compile_params*)params;
 	return 0;
@@ -146,15 +168,76 @@ void execute(HWND hwnd, message msg) {
 			commands.erase(commands.find(msg[1]));
 			DeleteFileA(std::string("commands\\compiled\\" + msg[1] + ".dll").c_str());
 		}
-		if(msg[0] == "new" && msg.size() >= 2 && GetFileAttributesA(std::string("commands\\tmp\\" + msg[1] + ".txt").c_str()) == INVALID_FILE_ATTRIBUTES) {
-			std::ofstream create { "commands\\raw\\" + msg[1] + ".txt" };
-			for(size_t i {2}; i < msg.size(); i++)
-				create << msg[i] << ((1+1==msg.size())?"":" ");
+		if(msg[0] == "new" && msg.size() >= 2 && GetFileAttributesA(std::string("commands\\raw\\" + msg[1] + ".txt").c_str()) == INVALID_FILE_ATTRIBUTES) {
+			std::ofstream create { "commands\\raw\\" + msg[1] + ".txt", std::ios::out};
 			create.close();
 		}
-		if(msg[0] == "del" && msg.size() >= 2 && GetFileAttributesA(std::string("commands\\tmp\\" + msg[1] + ".txt").c_str()) != INVALID_FILE_ATTRIBUTES) {
-			DeleteFileA(std::string("commands\\tmp\\" + msg[1] + ".txt").c_str());
+		if(msg[0] == "app" && msg.size() >= 2 && GetFileAttributesA(std::string("commands\\raw\\" + msg[1] + ".txt").c_str()) != INVALID_FILE_ATTRIBUTES) {
+			std::ofstream app { "commands\\raw\\" + msg[1] + ".txt", std::ios::app};
+			app << '\n';
+			for(size_t i {2}; i < msg.size();)
+				app << msg[i] << ((++i==msg.size())?"":" ");
+			app.close();
 		}
+		if(msg[0] == "pop" && msg.size() >= 2 && GetFileAttributesA(std::string("commands\\raw\\" + msg[1] + ".txt").c_str()) != INVALID_FILE_ATTRIBUTES) {
+			std::ifstream in("commands\\raw\\" + msg[1] + ".txt");
+			std::ofstream out("commands\\raw\\" + msg[1] + ".tmp");
+			std::string line;
+			std::getline(in, line);
+			for(std::string tmp; std::getline(in, tmp); line.swap(tmp))
+				if(line.size())
+					out << '\n' << line;
+			in.close();
+			out.close();
+			DeleteFileA(std::string("commands\\raw\\" + msg[1] + ".txt").c_str());
+			std::rename(("commands\\raw\\" + msg[1] + ".tmp").c_str(), ("commands\\raw\\" + msg[1] + ".txt").c_str());
+		}
+		if(
+			msg[0] == "rem" &&
+			msg.size() >= 3 &&
+			!msg[2].empty() && std::find_if(msg[2].begin(), msg[2].end(),
+				[](unsigned char c) { return !std::isdigit(c); }) == msg[2].end() &&
+			GetFileAttributesA(std::string("commands\\raw\\" + msg[1] + ".txt").c_str()) != INVALID_FILE_ATTRIBUTES
+		) {
+			std::ifstream in { "commands\\raw\\" + msg[1] + ".txt" };
+			std::ofstream out { "commands\\raw\\" + msg[1] + ".tmp" };
+			std::string line;
+			size_t rem = std::stoi(msg[2].c_str());
+			std::string tmp;
+			size_t at { };
+			do {
+				line.swap(tmp);
+				if(at != rem && line.size())
+					out << ((at)?"\n":"") << line;
+				at++;
+			} while(std::getline(in, tmp));
+			in.close();
+			out.close();
+			DeleteFileA(std::string("commands\\raw\\" + msg[1] + ".txt").c_str());
+			std::rename(("commands\\raw\\" + msg[1] + ".tmp").c_str(), ("commands\\raw\\" + msg[1] + ".txt").c_str());
+		}
+		if(msg[0] == "raw" && msg.size() >= 2 && GetFileAttributesA(std::string("commands\\raw\\" + msg[1] + ".txt").c_str()) != INVALID_FILE_ATTRIBUTES) {
+			std::ifstream file { "commands\\raw\\" + msg[1] + ".txt" };
+			std::string str;
+			for(size_t at { }; std::getline(file, str);)
+				send(hwnd, "/tell " + msg.name + " " + std::to_string(++at) + ": " + str);
+			file.close();
+		}
+		if(msg[0] == "tellall" && msg.size() >= 2 && GetFileAttributesA(std::string("commands\\raw\\" + msg[1] + ".txt").c_str()) != INVALID_FILE_ATTRIBUTES) {
+			std::ifstream file { "commands\\raw\\" + msg[1] + ".txt" };
+			std::string str;
+			for(size_t at { }; std::getline(file, str);)
+				send(hwnd, "/say " + std::to_string(++at) + ": " + str);
+			file.close();
+		}
+		if(msg[0] == "del" && msg.size() >= 2 && GetFileAttributesA(std::string("commands\\raw\\" + msg[1] + ".txt").c_str()) != INVALID_FILE_ATTRIBUTES)
+			DeleteFileA(std::string("commands\\raw\\" + msg[1] + ".txt").c_str());
+	}
+	if(GetFileAttributesA(std::string("commands\\compiled\\" + msg[0] + ".dll").c_str()) != INVALID_FILE_ATTRIBUTES) {
+		HINSTANCE dll = LoadLibraryA(std::string("commands\\compiled\\" + msg[0] + ".dll").c_str());
+		mccommand func = (mccommand)GetProcAddress(dll, msg[0].c_str());
+		commands.emplace(msg[0], func);
+		dlls.emplace(msg[0], dll);
 	}
 	if(commands.contains(msg[0])) {
 		(*commands[msg[0]])(hwnd, msg);
@@ -204,8 +287,18 @@ int main(int argc, char** argv) {
 		SetWindowTextA(hwnd, SERVERWND);
 	}
 
+	std::vector<std::string> commands = files_in_dir("commands\\raw");
+	for(std::string &i : commands) {
+		message msg { };
+		msg.tokens.push_back(i.substr(0, i.size() - 4));
+		if(GetFileAttributesA(std::string("commands\\compiled\\" + msg[0] + ".dll").c_str()) == INVALID_FILE_ATTRIBUTES) {
+			HANDLE thread = CreateThread(NULL, 0, &compile_command, new compile_params(nullptr, msg), 0, NULL);
+			if(thread) to_close.push_back(thread);
+		}
+	}
+
 //	Opens the log file
-	std::ifstream file { LOGFILE };
+	std::ifstream file { LOGFILE, std::ios::in };
 //	This is the current line in the log file
 	long long at = 0;
 	if(!file.is_open())
@@ -219,9 +312,10 @@ int main(int argc, char** argv) {
 	}
 	std::string str;
 	message msg;
+//	TODO - HIGH PRIORITY: make this not take an entire thread
 	while(true) {
 //		There's probably be a better way to do this but if it isn't closed then opened before reading it won't properly read it
-		file.open(LOGFILE);
+		file.open(LOGFILE, std::ios::in);
 		if(!file.is_open()) {
 			std::cout << "Couldn't open log file!!\n";
 			continue;
