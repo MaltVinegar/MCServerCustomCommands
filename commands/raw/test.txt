@@ -1,0 +1,1 @@
+send(hwnd, "/say Hello World");

@@ -1,0 +1,2 @@
+send(hwnd, "/tellraw " + msg.name + " {\"text\":\"List of commands:\"}");
+send(hwnd, "/tellraw " + msg.name + " {\"text\":\"    Use #tp [player name] to teleport to another player\"}");
