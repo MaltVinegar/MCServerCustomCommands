@@ -4,6 +4,9 @@
 #include <fstream>
 #include <limits>
 #include <algorithm>
+#include <map>
+#include <sstream>
+#include <stdlib.h>
 
 //Name of the window the batch file is running on
 #define SERVERWND "MCServerCommands"
@@ -13,6 +16,13 @@
 
 //Location of the live log file
 #define LOGFILE "logs/latest.log"
+
+//The location of your C++ compiler
+#define CC "E:\\compiling\\cygwin64\\bin\\g++.exe"
+
+//For now only this player can mess with commands
+//Eventually I'll make it so all operators can
+#define OP "iwwenjoyer"
 
 /******************** unimportant for making commands ********************/
 struct ProcessWindowsInfo {
@@ -42,71 +52,81 @@ std::ifstream& goto_line(std::ifstream& file, long long num){
 }
 /*************************************************************************/
 
-//Sends text directly to the window handle hwnd; used for sending commands to the server
-void send(HWND hwnd, std::string str) {
-	for(char i : str)
-		PostMessage(hwnd, WM_CHAR, i, 0);
-//	Sends enter key
-	PostMessage(hwnd, WM_CHAR, 13, 0);
-//	When multiple `send` functions are called in a row it will improperly write for some reason
-//	This seems to fix it
-//	If consecutive commands are executing incorrectly it's probably because this is too short for you, try increasing it a little
-	Sleep(4);
-}
+#include "commands/functions.h"
 
+typedef void(*mccommand)(HWND, message);
 
-struct message {
-	message() { }
+std::map<std::string, mccommand> commands { };
+std::map<std::string, HMODULE> dlls { };
 
-//	Takes a string formatted like a line from the live log file
-//	Splits it into time, thread info, name, and the body
-//	Allows it to be more easily parsed
-	message(std::string str) {
-		auto at = str.begin();
-		auto end = str.end();
-		while(*++at != ']')
-			time += *at;
-		at += 2;
-		while(*++at != ']')
-			info += *at;
-		at += 2;
-		if(*++at == '<' || *at == '[')
-			while(*++at != '>' && *at != ']')
-				name += *at;
-		++at;
-		while(++at < end)
-			said += *at;
-	}
-//	Splits the body of the line at each space
-//	A message like `#com ab c and 100` would be split into
-//	"com", "ab", "c", "and", "100"
-	void tokenize() {
-		auto at = said.begin() + 1;
-		auto end = said.end();
-		while(at < end) {
-			tokens.emplace_back();
-			while(*at != ' ' && at < end)
-				tokens.back() += *at++;
-			++at;
-		}
-	}
-//	Gets an item in the list of tokens by index
-	std::string &operator[](size_t i) { return tokens.at(i); }
-//	Gets the size of the token list
-	size_t size() { return tokens.size(); }
+std::vector<HANDLE> to_close;
+HANDLE current_thread;
 
-//			Example:
-//	[00:14:59] [Server thread/INFO]: <IWWenjoyer> Hello World!
-	std::string time { };					//	"00:14:59"
-	std::string info { };					//	"Server thread/INFO"
-	std::string name { };					//	"IWWenjoyer"
-	std::string said { };					//	"Hello World!"
-	std::vector<std::string> tokens { };	//	"Hello", "World!"
+struct compile_params {
+	compile_params(HWND hwnd, message msg) :
+		hwnd { hwnd },
+		msg { msg }
+	{ }
+
+	HWND hwnd;
+	message msg;
 };
 
-//	This is where all the commands are
+DWORD WINAPI compile_command(LPVOID params) {
+	HWND hwnd = ((compile_params*)params)->hwnd;
+	message msg = ((compile_params*)params)->msg;
+	std::ifstream raw { "commands\\raw\\" + msg[0] + ".txt" };
+	if(!raw.is_open()) {
+		delete (compile_params*)params;
+		return 0;
+	}
+	std::stringstream buffer;
+	buffer << raw.rdbuf() << '\n';
+	raw.close();
+
+	std::ofstream formatted { "commands\\tmp\\" + msg[0] + ".cpp" };
+	if(!formatted.is_open()) {
+		delete (compile_params*)params;
+		return 0;
+	}
+	formatted << "#include \"commands\\functions.h\"\n";
+	formatted << "extern \"C\" void __declspec(dllexport) " + msg[0] + "(HWND hwnd, message msg) {\n";
+	formatted << buffer.str();
+	formatted << "}";
+	formatted.close();
+
+	SHELLEXECUTEINFOA compile { 0 };
+
+	std::string exec = std::string("commands\\tmp\\" + msg[0] + ".cpp -shared -o commands\\compiled\\" + msg[0] + ".dll commands\\functions.o");
+
+	compile.cbSize			= sizeof(SHELLEXECUTEINFOA);
+	compile.fMask			= SEE_MASK_NOCLOSEPROCESS;
+	compile.lpVerb			= "open";
+	compile.lpFile			= CC;
+	compile.lpParameters	= exec.c_str();
+	compile.lpDirectory		= NULL;
+	compile.nShow			= SW_MINIMIZE;
+	compile.hInstApp		= NULL;
+
+	ShellExecuteExA(&compile);
+	WaitForSingleObject(compile.hProcess, INFINITE);
+
+	if(GetFileAttributesA(std::string("commands\\compiled\\" + msg[0] + ".dll").c_str()) == INVALID_FILE_ATTRIBUTES) {
+		delete (compile_params*)params;
+		return 0;
+	}
+	HINSTANCE dll = LoadLibraryA(std::string("commands\\compiled\\" + msg[0] + ".dll").c_str());
+	mccommand func = (mccommand)GetProcAddress(dll, msg[0].c_str());
+	(*func)(hwnd, msg);
+	commands.emplace(msg[0], func);
+	dlls.emplace(msg[0], dll);
+
+	delete (compile_params*)params;
+	return 0;
+}
+
 //	Some example commands are provided
-//	TODO: make a system to store commands in plain text and load live
+//	TODO: add a way to query in-game values
 void execute(HWND hwnd, message msg) {
 //	Is it said by a player? Did they say anything?
 	if(!msg.name.length() || !msg.said.length()) return;
@@ -119,19 +139,32 @@ void execute(HWND hwnd, message msg) {
 //	Splits up the message into more usable bits
 	msg.tokenize();
 
-/******************** put commands here / go wild! :D ********************/
-//	Don't forget to add your commands to the help command
-	if(msg[0] == "help") {
-		send(hwnd, "/tellraw " + msg.name + " {\"text\":\"List of commands:\"}");
-		send(hwnd, "/tellraw " + msg.name + " {\"text\":\"    Use #tp [player name] to teleport to another player\"}");
+	if(msg.name == OP) {
+		if(msg[0] == "unl" && msg.size() >= 2 && dlls.contains(msg[1])) {
+			FreeLibrary(dlls[msg[1]]);
+			dlls.erase(dlls.find(msg[1]));
+			commands.erase(commands.find(msg[1]));
+			DeleteFileA(std::string("commands\\compiled\\" + msg[1] + ".dll").c_str());
+		}
+		if(msg[0] == "new" && msg.size() >= 2 && GetFileAttributesA(std::string("commands\\tmp\\" + msg[1] + ".txt").c_str()) == INVALID_FILE_ATTRIBUTES) {
+			std::ofstream create { "commands\\raw\\" + msg[1] + ".txt" };
+			for(size_t i {2}; i < msg.size(); i++)
+				create << msg[i] << ((1+1==msg.size())?"":" ");
+			create.close();
+		}
+		if(msg[0] == "del" && msg.size() >= 2 && GetFileAttributesA(std::string("commands\\tmp\\" + msg[1] + ".txt").c_str()) != INVALID_FILE_ATTRIBUTES) {
+			DeleteFileA(std::string("commands\\tmp\\" + msg[1] + ".txt").c_str());
+		}
+	}
+	if(commands.contains(msg[0])) {
+		(*commands[msg[0]])(hwnd, msg);
 		return;
 	}
-	if(msg[0] == "tp" && msg.size() >= 2) {
-		if(msg[1] == msg.name) return;
-		send(hwnd, "/teleport " + msg.name + " " + msg[1]);
+	if(GetFileAttributesA(std::string("commands\\raw\\" + msg[0] + ".txt").c_str()) != INVALID_FILE_ATTRIBUTES) {
+		HANDLE thread = CreateThread(NULL, 0, &compile_command, new compile_params(hwnd, msg), 0, NULL);
+		if(thread) to_close.push_back(thread);
 		return;
 	}
-/*************************************************************************/
 }
 
 int main(int argc, char** argv) {
@@ -143,7 +176,7 @@ int main(int argc, char** argv) {
 
 //	If the server could not be found, start it
 	if(!hwnd) {
-		SHELLEXECUTEINFOA sei = {0};
+		SHELLEXECUTEINFOA sei { 0 };
 
 		sei.cbSize		= sizeof(SHELLEXECUTEINFOA);
 		sei.fMask		= SEE_MASK_NOCLOSEPROCESS;
@@ -206,5 +239,13 @@ int main(int argc, char** argv) {
 		}
 //		Closes the file
 		file.close();
+		if(WaitForSingleObject(current_thread, 0) == WAIT_OBJECT_0) {
+			CloseHandle(current_thread);
+			current_thread = NULL;
+		}
+		if(!current_thread && to_close.size()) {
+			current_thread = to_close.front();
+			to_close.erase(to_close.begin());
+		}
 	}
 }
